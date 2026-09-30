@@ -1,6 +1,16 @@
+/*
+project_ 4-Wheel Drive Electric Vehicle
 //ai google gemini GPS M9N, IMU MPU9250 , Pure Pursuit , ExtendedKalmanFilter , 
-//5-State Extended Kalman Filter (GPS M9N + SPI IMU + 4 Wheel Odom L298N + ESP8266)
+//5-State Extended Kalman Filter (GPS M9N + SPI IMU + 4 Wheel Odom L298N)
+by: tinnakon kheowree 
+0860540582
+tinnakon_za@hotmail.com
+tinnakonza@gmail.com
+http://quad3d-tin.lnwshop.com/
+https://www.facebook.com/tinnakonza
 
+UBLOX    - U-Blox binary protocol, use the ublox config file (u-blox-config.ublox.txt)
+*/
 #include <ESP8266WiFi.h>
 #include <WiFiUDP.h>
 #include <SoftwareSerial.h>
@@ -14,7 +24,9 @@ WiFiUDP Udp;
 const char* ssid     = "ชื่อ_WiFi_ของคุณ";
 const char* password = "รหัส_WiFi_ของคุณ";
 const char* targetIP = "111.111.111.111"; 
-const int udpPort    = 4210;                
+const int udpPort    = 4210;         
+       
+const int pinCS_IMU = 10; // พิน CS สำหรับ MPU9250 (SD3 บน NodeMCU)
 
 // โครงสร้างข้อมูลไบนารีจาก GPS M9N
 struct UBX_NAV_POSLLH_Payload {
@@ -28,6 +40,24 @@ struct UBX_NAV_VELNED_Payload {
 UBX_NAV_POSLLH_Payload navPosLLH;
 UBX_NAV_VELNED_Payload navVelNed;
 
+const uint8_t CFG_VALSET_POSLLH[] = {0xB5, 0x62, 0x06, 0x8A, 0x08, 0x00, 0x00, 0x07, 0x00, 0x00, 0x23, 0x00, 0x91, 0x20, 0x01, 0x65, 0xCA};
+const uint8_t CFG_VALSET_VELNED[] = {0xB5, 0x62, 0x06, 0x8A, 0x08, 0x00, 0x00, 0x07, 0x00, 0x00, 0x43, 0x00, 0x91, 0x20, 0x01, 0x85, 0x8D};
+const uint8_t CFG_VALSET_10HZ[]   = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x07, 0x00, 0x00, 0x01, 0x00, 0x21, 0x30, 0x64, 0x00, 0x4C, 0x8D};
+enum UBX_State { WAIT_SYNC1, WAIT_SYNC2, WAIT_CLASS, WAIT_ID, WAIT_LEN1, WAIT_LEN2, READ_PAYLOAD, WAIT_CKA, WAIT_CKB };
+enum UBX_State gpsState = WAIT_SYNC1;
+uint8_t currentID = 0;
+
+uint8_t gpsPayloadBuffer[128]; // มิติเดี่ยวระบุขนาดชัดเจน
+uint16_t payloadLength = 0;
+uint16_t payloadIndex = 0;
+uint8_t calcCK_A = 0, calcCK_B = 0;
+uint8_t receivedCK_A = 0, receivedCK_B = 0;
+
+void updateGpsChecksum(uint8_t data) {
+    calcCK_A += data;
+    calcCK_B += calcCK_A;
+}
+
 // คอนฟิกูเรชันพิกัด
 bool isHomeSet = false;
 double homeLat = 0.0, homeLon = 0.0;
@@ -35,9 +65,12 @@ const double EARTH_RADIUS = 6378137.0;
 
 // State Vector: [0:Pos_N, 1:Pos_E, 2:Vel_N, 3:Vel_E, 4:Heading]
 double x_est[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+double x_heading = 0.0;
 double P_cov[5][5] = { {1,0,0,0,0}, {0,1,0,0,0}, {0,0,1,0,0}, {0,0,0,1,0}, {0,0,0,0,0.1} };
+
 double filtered_lat = 0.0, filtered_lon = 0.0;
 unsigned long lastTime = 0;
+double imu_ax = 0.0, imu_ay = 0.0, imu_gz = 0.0;
 
 // พารามิเตอร์ Pure Pursuit
 struct Waypoint { double lat; double lon; double targetN; double targetE; };
@@ -116,6 +149,47 @@ double getVehicleOdomSpeed() {
     return (v_fl + v_fr + v_rl + v_rr) / 4.0;
 }
 
+// ==========================================
+// 5. ฟังก์ชันย่อยสำหรับเข้าถึง MPU9250 แบบไม่มีพอยน์เตอร์
+// ==========================================
+void writeRegisterSPI(uint8_t subAddress, uint8_t data) {
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+    digitalWrite(pinCS_IMU, LOW);
+    SPI.transfer(subAddress);
+    SPI.transfer(data);
+    digitalWrite(pinCS_IMU, HIGH);
+    SPI.endTransaction();
+}
+
+void setupNativeMPU9250() {
+    pinMode(pinCS_IMU, OUTPUT);
+    digitalWrite(pinCS_IMU, HIGH);
+    SPI.begin();
+    writeRegisterSPI(27, 0x08); 
+    writeRegisterSPI(28, 0x08); 
+}
+
+void readNativeIMU() {
+    uint8_t imuBuffer[14]; 
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+    digitalWrite(pinCS_IMU, LOW);
+    SPI.transfer(59 | 0x80); 
+    for (int i = 0; i < 14; i++) {
+        imuBuffer[i] = SPI.transfer(0x00);
+    }
+    digitalWrite(pinCS_IMU, HIGH);
+    SPI.endTransaction();
+    
+    int16_t raw_ax = (((int16_t)imuBuffer[0]) << 8) | imuBuffer[1];
+    int16_t raw_ay = (((int16_t)imuBuffer[2]) << 8) | imuBuffer[3];
+    int16_t raw_gz = (((int16_t)imuBuffer[12]) << 8) | imuBuffer[13];
+    
+    imu_ax = (double)raw_ax / 8192.0 * 9.80665;
+    imu_ay = (double)raw_ay / 8192.0 * 9.80665;
+    imu_gz = (double)raw_gz / 65.5 * DEG_TO_RAD;
+}
+
+
 // ฟังก์ชันแปลงพิกัดและการกรองมุม
 void convertLatLonToMeters(double lat, double lon, double &posN, double &posE) {
     if (!isHomeSet) { homeLat = lat; homeLon = lon; isHomeSet = true; }
@@ -132,32 +206,59 @@ double normalizeAngle(double angle) {
     while (angle < -PI) angle += 2.0 * PI;
     return angle;
 }
-
+bool parseGpsBinary() {
+    bool newGPSData = false;
+    while (Serial.available() > 0) {
+        uint8_t c = Serial.read();
+        switch (gpsState) {
+            case WAIT_SYNC1: if (c == 0xB5) gpsState = WAIT_SYNC2; break;
+            case WAIT_SYNC2: if (c == 0x62) gpsState = WAIT_CLASS; else gpsState = WAIT_SYNC1; break;
+            case WAIT_CLASS: calcCK_A = 0; calcCK_B = 0; updateGpsChecksum(c); if (c == 0x01) gpsState = WAIT_ID; else gpsState = WAIT_SYNC1; break;
+            case WAIT_ID: updateGpsChecksum(c); if (c == 0x02 || c == 0x12) { currentID = c; gpsState = WAIT_LEN1; } else gpsState = WAIT_SYNC1; break;
+            case WAIT_LEN1: updateGpsChecksum(c); payloadLength = c; gpsState = WAIT_LEN2; break;
+            case WAIT_LEN2: updateGpsChecksum(c); payloadLength |= (c << 8);
+                if ((currentID == 0x02 && payloadLength == 28) || (currentID == 0x12 && payloadLength == 36)) { payloadIndex = 0; gpsState = READ_PAYLOAD; } 
+                else gpsState = WAIT_SYNC1; break;
+            case READ_PAYLOAD: updateGpsChecksum(c); if (payloadIndex < sizeof(gpsPayloadBuffer)) gpsPayloadBuffer[payloadIndex++] = c;
+                if (payloadIndex >= payloadLength) gpsState = WAIT_CKA; break;
+            case WAIT_CKA: receivedCK_A = c; gpsState = WAIT_CKB; break;
+            case WAIT_CKB: receivedCK_B = c;
+                if (calcCK_A == receivedCK_A && calcCK_B == receivedCK_B) {
+                    if (currentID == 0x02) memcpy(&navPosLLH, gpsPayloadBuffer, sizeof(navPosLLH));
+                    if (currentID == 0x12) memcpy(&navVelNed, gpsPayloadBuffer, sizeof(navVelNed));
+                    newGPSData = true;
+                }
+                gpsState = WAIT_SYNC1; break;
+        }
+    }
+    return newGPSData;
+}
 // ==========================================
 // 🏎️ EXTENDED KALMAN FILTER WITH MOTOR FUSION
 // ==========================================
-void runExtendedKalmanFilter(double dt) {
-    IMU.readSensor();
-    double ax = IMU.getAccelX_mss(); 
-    double ay = IMU.getAccelY_mss(); 
-    double gz = IMU.getGyroZ_rads(); 
+void runExtendedKalmanFilter(double dt, bool hasNewGps) {
+    readNativeIMU(); 
 
     // อ่านความเร็วจากมอเตอร์ 4 ตัวผ่านฟังก์ชัน Odometry
     double v_odom = getVehicleOdomSpeed();
+    
+    // --- 1. PREDICTION PHASE (ทำนายล่วงหน้าผ่านตัวแปรเดี่ยว) ---
+    double a_North = imu_ax * cos(x_heading) - imu_ay * sin(x_heading);
+    double a_East  = imu_ax * sin(x_heading) + imu_ay * cos(x_heading);
+
 
     // ดึงค่าทิศทางปัจจุบันจากตัวกรอง
     double theta = x_est[4]; 
 
     // --- [1. PREDICTION PHASE: ขับเคลื่อนโมเดลด้วย IMU + Gyro] ---
-    double a_North = ax * cos(theta) - ay * sin(theta);
-    double a_East  = ax * sin(theta) + ay * cos(theta);
 
     x_est[0] += (x_est[2] * dt) + (0.5 * a_North * dt * dt); // Pos_N
     x_est[1] += (x_est[3] * dt) + (0.5 * a_East * dt * dt);  // Pos_E
     x_est[2] += a_North * dt;                               // Vel_N
     x_est[3] += a_East * dt;                                // Vel_E
-    x_est[4] += gz * dt;                                    // Headingจาก Gyro
+    x_est[4] += imu_gz * dt;                                    // Headingจาก Gyro
     x_est[4] = normalizeAngle(x_est[4]);
+    x_heading = x_est[4];
 
     double q_imu = 0.05; double q_gyro = 0.01;
     for(int i=0; i<4; i++) P_cov[i][i] += q_imu * dt;
@@ -178,7 +279,7 @@ void runExtendedKalmanFilter(double dt) {
     P_cov[3][3] *= (1.0 - K_odomE);
 
     // --- [3. UPDATE PHASE 2: ปรับแก้ด้วยสัญญาณไบนารีจาก GPS M9N] ---
-    if (gpsSerial.available() > 0) {
+    if (hasNewGps) {
         // (ระบบพาร์สเซอร์จะดักจับข้อมูลเข้าโครงสร้างอัตโนมัติ)
         double z_posN, z_posE;
         convertLatLonToMeters(navPosLLH.lat/10000000.0, navPosLLH.lon/10000000.0, z_posN, z_posE);
@@ -252,7 +353,17 @@ void setupL298N() {
     pinMode(pinIN4, OUTPUT);
     pinMode(pinENB, OUTPUT);
 }
-void driveL298N(double speedLeft, double speedRight) {
+void driveL298N() {
+  double speedLeft = 0.0, speedRight = 0.0;
+  if (!isNavigationComplete && isHomeSet) {
+double abs_steer = abs(steering_angle_deg);
+double target_base_speed = MAX_BASE_SPEED * (1.0 - (abs_steer / 45.0));
+target_base_speed = constrain(target_base_speed, MIN_BASE_SPEED, MAX_BASE_SPEED);
+double target_yaw_rate = (target_base_speed * tan(steering_angle_deg * DEG_TO_RAD)) / WHEELBASE;
+speedLeft  = target_base_speed - (target_yaw_rate * TRACK_WIDTH / 2.0);
+speedRight = target_base_speed + (target_yaw_rate * TRACK_WIDTH / 2.0);
+}
+
     // 1. แปลงความเร็ว m/s เป็นค่า PWM (0-255)
     // สมมติความเร็วสูงสุด 1.5 m/s เทียบเท่า PWM 255
     int pwmLeft = map(constrain(abs(speedLeft), 0.0, 1.5), 0.0, 1.5, 0, 255);
@@ -278,13 +389,23 @@ void driveL298N(double speedLeft, double speedRight) {
     }
     analogWrite(pinENB, pwmRight);
 }
+// ==========================================
+// 9. ฟังก์ชันตั้งค่าระบบและลูปหลัก
+// ==========================================
 void setup() {
-    Serial.begin(115200); gpsSerial.begin(38400);
+    Serial.begin(115200); 
+    gpsSerial.begin(38400);//gps 115200
+    gpsSerial.print("$PUBX,41,1,0003,0001,115200,0*1E\r\n");
+    gpsSerial.begin(115200);
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) { delay(500); }
+    Serial.write(CFG_VALSET_POSLLH, sizeof(CFG_VALSET_POSLLH)); delay(100);
+    Serial.write(CFG_VALSET_VELNED, sizeof(CFG_VALSET_VELNED)); delay(100);
+    Serial.write(CFG_VALSET_10HZ,   sizeof(CFG_VALSET_10HZ));   delay(100);
     IMU.begin();
     IMU.setAccelRange(MPU9250::ACCEL_RANGE_4G);
     IMU.setGyroRange(MPU9250::GYRO_RANGE_500DPS);
+    //setupNativeMPU9250();
     lastTime = micros();
 }
 
@@ -293,16 +414,19 @@ void loop() {
     double dt = (now - lastTime) / 1000000.0;
     lastTime = now;
     if (dt <= 0.0 || dt > 0.1) dt = 0.01;
+    bool hasGpsUpdate = parseGpsBinary();
 
     // 1. ประมวลผลฟิวชันพิกัดตำแหน่งตัวรถระดับ 100Hz
-    runExtendedKalmanFilter(dt);
+    runExtendedKalmanFilter(dt, hasGpsUpdate);
+    //runExtendedKalmanFilter(dt);
     
     // 2. คำนวณหามุมหักเลี้ยวเป้าหมายจาก Pure Pursuit
     updatePurePursuit();
 
     // 3. ใหม่: คำนวณความเร็วแยกแต่ละมอเตอร์ด้วย Differential Drive
     calculateDifferentialDrive();
-
+    driveL298N();
+    
     // 4. แพ็กข้อมูลมอนิเตอร์ รวมถึงความเร็วมอเตอร์ฝั่งซ้าย-ขวา ส่งออกไร้สาย
     double current_speed = sqrt(sq(x_est[2]) + sq(x_est[3])) * 3.6;
     String telemetryData = String(filtered_lat, 7) + "," + String(filtered_lon, 7) + "," + 
@@ -312,7 +436,7 @@ void loop() {
 
     Udp.beginPacket(targetIP, udpPort); 
     Udp.write(telemetryData.c_str()); 
-    Udp.endPacket();
+    Udp.endPacket(); 
 
     // ----------------------------------------------------------------------
     // 🛠️ หน้างาน: ส่วนแปลงหน่วยความเร็วเป็นสัญญาณควบคุมไดรเวอร์มอเตอร์ของคุณจริง
