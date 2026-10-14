@@ -306,7 +306,124 @@ void Main_Kalman_Update_Loop(float dtt, float FL_pwm2, float FR_pwm2, float BL_p
   X_2 = X_2 + (vel_world_E + (final_posE - X_2) * K_pos_E) * dtt;
 }
 ////////////////////////////////////////////////////////////////////////////
+// ==================================================================
+// 📌 กำหนดค่าคงที่เกน PID (Tuning Parameters - ปรับแต่งตามน้ำหนักรถจริง)
+// ==================================================================
+// เกนสำหรับควบคุมตำแหน่งและทิศทาง (Outer Loop)
+float Kp_pos = 1.20f;   // เกนดึงรถเข้าหาจุดเป้าหมายพิกัด
+float Kp_yaw = 2.50f;   // เกนหมุนหัวรถให้ตรงทางเป้าหมาย
+float Kd_yaw = 0.15f;
 
+// เกนสำหรับควบคุมความเร็วรอบล้อ (Inner Loop มอเตอร์)
+float Kp_wheel = 3.50f;
+float Ki_wheel = 0.12f;
+float Kd_wheel = 0.05f;
+
+// ขีดจำกัดทางฮาร์ดแวร์รถ
+#define MAX_PWM 255.0f
+#define TRACK_WIDTH 0.5f // ระยะห่างระว่างล้อซ้าย-ขวา (เมตร)
+
+// ==================================================================
+// 🚀 ฟังก์ชันหลัก: ระบบควบคุม PID ตำแหน่งและความเร็วล้อรถ 4 ล้อแยกอิสระ
+// ==================================================================
+void Main_PID_Control_Loop(float dtt, float target_X, float target_Y) {
+  
+  // ------------------------------------------------------------------
+  // STEP 1: OUTER LOOP - POSITION CONTROL (คำนวณหาจุดต่างและมุมหันของรถ)
+  // ------------------------------------------------------------------
+  // 1. คำนวณระยะห่างพิกัดปัจจุบัน (X_1, X_2) เทียบกับจุดเป้าหมาย (target_X, target_Y)
+  float error_X = target_X - X_1;
+  float error_Y = target_Y - X_2;
+  float distance_error = sqrt((error_X * error_X) + (error_Y * error_Y));
+
+  // 2. คำนวณมุมเป้าหมายที่รถต้องหันหัวไป (Target Heading Angle)
+  float target_yaw = atan2(error_Y, error_X);
+  
+  // 3. คำนวณส่วนต่างมุมหน้ารถปัจจุบัน (X_3 คือมุม Yaw ที่คาลมานคำนวณชดเชยแล้ว)
+  float yaw_error = target_yaw - X_3;
+  
+  // บังคับส่วนต่างมุมให้อยู่ในช่วง -PI ถึง +PI เพื่อให้รถเลือกเลี้ยวในมุมที่สั้นที่สุดเสมอ
+  if (yaw_error > M_PI)  yaw_error -= 2.0f * M_PI;
+  if (yaw_error < -M_PI) yaw_error += 2.0f * M_PI;
+
+  // 4. คำนวณคำสั่งควบคุมหลักประจำตัวรถ (Vx: ความเร็วตรง, Wz: ความเร็วหมุนเลี้ยว)
+  float cmd_Vx = distance_error * Kp_pos;
+  
+  static float last_yaw_error = 0.0f;
+  float cmd_Wz = (yaw_error * Kp_yaw) + ((yaw_error - last_yaw_error) / dtt * Kd_yaw);
+  last_yaw_error = yaw_error;
+
+  // จำกัดความเร็วตรงสูงสุดไม่ให้ล้อฟรีทิ้งรุนแรง
+  if (cmd_Vx > 1.5f) cmd_Vx = 1.5f; // จำกัดที่ 1.5 m/s
+  
+  // ถ้าใกล้ถึงจุดหมายแล้ว (ระยะ < 10 ซม.) ให้หยุดเดินหน้า สั่งหมุนคุมตำแหน่งนิ่งๆ
+  if (distance_error < 0.10f) cmd_Vx = 0.0f;
+
+  // ------------------------------------------------------------------
+  // STEP 2: DYNAMIC MIXER (แปลงคำสั่งความเร็วตัวรถ แยกสเกลเป็นรายล้อซ้าย-ขวา)
+  // ------------------------------------------------------------------
+  // สูตรคณิตศาสตร์จลนศาสตร์ผกผัน (Inverse Kinematics) ของรถถัง Skid-Steer
+  float target_vel_Left  = cmd_Vx - (cmd_Wz * TRACK_WIDTH / 2.0f);
+  float target_vel_Right = cmd_Vx + (cmd_Wz * TRACK_WIDTH / 2.0f);
+
+  // แปลงหน่วย m/s เป็นความเร็วรอบเรเดียนต่อวินาที (rad/s) เพื่อให้ตรงกับสถานะคาลมาน X_7 - X_10
+  // สมมติล้อรถมีเส้นผ่านศูนย์กลางขนาดเท่าในรูปภาพ (รัศมีล้อ R ประมาณ 0.13 เมตร)
+  float wheel_radius = 0.13f;
+  float target_w_Left  = target_vel_Left  / wheel_radius;
+  float target_w_Right = target_vel_Right / wheel_radius;
+
+  // ------------------------------------------------------------------
+  // STEP 3: INNER LOOP - CLOSED-LOOP SPEED PID (คุมรอบล้อมอเตอร์รายล้อ)
+  // ------------------------------------------------------------------
+  // ประกาศตัวแปรสะสมค่าความผิดพลาดสะสม (Integral Errors) แบบ Static
+  static float err_sum_FL = 0.0f, err_sum_BL = 0.0f;
+  static float err_sum_FR = 0.0f, err_sum_BR = 0.0f;
+  static float last_err_FL = 0.0f, last_err_BL = 0.0f;
+  static float last_err_FR = 0.0f, last_err_BR = 0.0f;
+
+  // คำนวณหา Error ของล้อแต่ละล้อ เทียบกับสถานะความเร็วรอบบริสุทธิ์จากคาลมานฟิลเตอร์
+  float err_FL = target_w_Left  - X_7;   // ล้อหน้าซ้าย
+  float err_BL = target_w_Left  - X_9;   // ล้อหลังซ้าย
+  float err_FR = target_w_Right - X_8;   // ล้อหน้าขวา
+  float err_BR = target_w_Right - X_10;  // ล้อหลังขวา
+
+  // สะสมค่าความเพี้ยนเพื่อล้างภาระโหลดตอนเจอเนินหญ้าขรุขระ (Integral Term)
+  err_sum_FL += err_FL * dtt; err_sum_BL += err_BL * dtt;
+  err_sum_FR += err_FR * dtt; err_sum_BR += err_BR * dtt;
+
+  // สมการ PID ขับจ่ายสัญญาณกำลัง PWM ออกสู่ชุดมอเตอร์ไดรฟ์ทักล้อ
+  float FL_out = (err_FL * Kp_wheel) + (err_sum_FL * Ki_wheel) + ((err_FL - last_err_FL) / dtt * Kd_wheel);
+  float BL_out = (err_BL * Kp_wheel) + (err_sum_BL * Ki_wheel) + ((err_BL - last_err_BL) / dtt * Kd_wheel);
+  float FR_out = (err_FR * Kp_wheel) + (err_sum_FR * Ki_wheel) + ((err_FR - last_err_FR) / dtt * Kd_wheel);
+  float BR_out = (err_BR * Kp_wheel) + (err_sum_BR * Ki_wheel) + ((err_BR - last_err_BR) / dtt * Kd_wheel);
+
+  // บันทึกค่าประวัติความผิดพลาดรอบนี้ไว้ใช้รอบถัดไป
+  last_err_FL = err_FL; last_err_BL = err_BL;
+  last_err_FR = err_FR; last_err_BR = err_BR;
+
+  // ------------------------------------------------------------------
+  // STEP 4: SATURATION & HARDWARE OUTPUT (กรองสเกลสัญญาณจำกัดเพดานไฟ)
+  // ------------------------------------------------------------------
+  // บังคับจำกัดไฟ PWM ไม่ให้ทะลุระดับบอร์ดพัง (ช่วง -255.0 ถึง +255.0 โวลต์สมมติ)
+  if (FL_out > MAX_PWM) FL_out = MAX_PWM; else if (FL_out < -MAX_PWM) FL_out = -MAX_PWM;
+  if (BL_out > MAX_PWM) BL_out = MAX_PWM; else if (BL_out < -MAX_PWM) BL_out = -MAX_PWM;
+  if (FR_out > MAX_PWM) FR_out = MAX_PWM; else if (FR_out < -MAX_PWM) FR_out = -MAX_PWM;
+  if (BR_out > MAX_PWM) BR_out = MAX_PWM; else if (BR_out < -MAX_PWM) BR_out = -MAX_PWM;
+
+  // 📌 นำค่าออกส่งคำสั่งต่อไปยังภาคควบคุมมอเตอร์ฮาร์ดแวร์รถของคุณ (เช่น บอร์ดไดรฟ์ IBTI / Sabertooth)
+  analogWrite(pin_motor_FL_PWM, abs((int)FL_out));
+  analogWrite(pin_motor_BL_PWM, abs((int)BL_out));
+  analogWrite(pin_motor_FR_PWM, abs((int)FR_out));
+  analogWrite(pin_motor_BR_PWM, abs((int)BR_out));
+  
+  // ทิศทางขั้วมอเตอร์ ดักตามเครื่องหมาย +/- ของค่าลัพธ์ PID
+  digitalWrite(pin_motor_FL_DIR, (FL_out >= 0) ? HIGH : LOW);
+  digitalWrite(pin_motor_BL_DIR, (BL_out >= 0) ? HIGH : LOW);
+  digitalWrite(pin_motor_FR_DIR, (FR_out >= 0) ? HIGH : LOW);
+  digitalWrite(pin_motor_BR_DIR, (BR_out >= 0) ? HIGH : LOW);
+}
+
+///////////////////////////////////////////////////////////////////////////
 void calculateDifferentialDrive() {
     if (isNavigationComplete) {
         // หากถึงเป้าหมาย Waypoint ครบถ้วนแล้ว สั่งหยุดมอเตอร์ทั้งหมดทันที
