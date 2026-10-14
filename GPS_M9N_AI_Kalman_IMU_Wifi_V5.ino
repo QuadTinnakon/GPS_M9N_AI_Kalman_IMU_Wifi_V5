@@ -140,8 +140,47 @@ float X_11 = 0.0f; // Accel X Filtered
 float X_12 = 0.0f; // Accel Y Filtered
 
 // ระยะติดตั้งเซนเซอร์ GPS/LiDAR ห่างจากจุดศูนย์กลางเครื่อง (CG) หน่วย: เมตร
-#define OFFSET_GPS_X  0.10f  
-#define OFFSET_GPS_Y  0.00f  
+//#define OFFSET_GPS_X  0.10f  
+//#define OFFSET_GPS_Y  0.00f  
+
+// --- ตัวแปรโครงสร้างข้อมูลสำหรับถอดรหัส UBX NAV-PVT (ความยาว Payload 92 Bytes) ---
+#pragma pack(push, 1)
+struct UBX_NAV_PVT {
+    uint32_t iTOW;       // GPS time of week (ms)
+    uint16_t year;       // Year (UTC)
+    uint8_t  month;      // Month, range 1..12 (UTC)
+    uint8_t  day;        // Day of month, range 1..31 (UTC)
+    uint8_t  hour;       // Hour of day, range 0..23 (UTC)
+    uint8_t  min;        // Minute of hour, range 0..59 (UTC)
+    uint8_t  sec;        // Seconds of minute, range 0..60 (UTC)
+    uint8_t  valid;      // Validity flags
+    uint32_t tAcc;       // Time accuracy estimate (ns)
+    int32_t  nano;       // Fraction of second (ns), range -1e9 .. 1e9 (UTC)
+    uint8_t  fixType;    // GPSfix Type (0: no fix, 3: 3D fix etc.)
+    uint8_t  flags;      // Fix status flags
+    uint8_t  flags2;     // Additional flags
+    uint8_t  numSV;      // Number of satellites used in Nav Solution
+    int32_t  lon;        // Longitude (1e-7 deg) -> พิกัดจริงดิบ M9N
+    int32_t  latt;        // Latitude (1e-7 deg) -> พิกัดจริงดิบ M9N
+    int32_t  height;     // Height above ellipsoid (mm)
+    int32_t  hMSL;       // Height above mean sea level (mm)
+    uint32_t hAcc;       // Horizontal accuracy estimate (mm)
+    uint32_t vAcc;       // Vertical accuracy estimate (mm)
+    int32_t  velN;       // NED north velocity (mm/s)
+    int32_t  velE;       // NED east velocity (mm/s)
+    int32_t  velD;       // NED down velocity (mm/s)
+    int32_t  gSpeed;     // Ground Speed (2D) (mm/s) -> ความเร็วดิบ M9N
+    int32_t  headMot;    // Heading of motion (1e-5 deg)
+    uint32_t sAcc;       // Speed accuracy estimate (mm/s)
+    uint32_t headAcc;    // Heading accuracy estimate (1e-5 deg)
+    uint16_t pDOP;       // Position DOP (0.01)
+    uint8_t  flags3;     // Additional flags
+    uint8_t  reserved1[5]; // Reserved bytes
+    int32_t  headVeh;    // Heading of vehicle (1e-5 deg)
+    int16_t  magDec;     // Magnetic declination (1e-2 deg)
+    uint16_t magAcc;     // Magnetic declination accuracy (1e-2 deg)
+};
+#pragma pack(pop)
 
 // อาร์เรย์และค่าแชร์จากหน่วยประมวลผลฉากหลัง (Background RTOS Tasks)
 extern float global_lidar_distance[360];
