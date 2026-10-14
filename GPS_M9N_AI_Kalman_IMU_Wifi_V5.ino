@@ -14,8 +14,23 @@ UBLOX    - U-Blox binary protocol, use the ublox config file (u-blox-config.ublo
 #include <ESP8266WiFi.h>
 #include <WiFiUDP.h>
 #include <SoftwareSerial.h>
+#include <SoftwareSerial.h> // 📌 เรียกใช้งานไลบรารี EspSoftwareSerial สำหรับช่องทางที่ 4
+#include <math.h>
 #include <SPI.h>
 #include "MPU9250.h"
+
+#define RX1_B1PIN 16     
+#define TX1_B1PIN 17     
+#define RX2_LIDAR 18     
+#define TX2_LIDAR 19     
+#define RPLIDAR_MOTOR 5  
+
+// 📌 กำหนดขา GPIO ว่างสำหรับต่อเซนเซอร์ A01NYUB (สามารถเปลี่ยนเบอร์ขาได้ตามสะดวกครับ)
+#define RX3_A01NYUB 15   // ต่อเข้าขา TX ของเซนเซอร์ A01NYUB
+#define TX3_A01NYUB 4   // ต่อเข้าขา RX ของเซนเซอร์ (ถ้าไม่ใช้ส่งคำสั่ง ปล่อยลอยได้ครับ)
+
+////SoftwareSerial Serial3;  // 🚀 สถาปนาออบเจกต์ช่องซีเรียลช่องที่ 4 ขึ้นมาใช้งาน
+SoftwareSerial Serial3(RX3_A01NYUB, TX3_A01NYUB, false, 256); 
 
 MPU9250 IMU(SPI, 2); 
 SoftwareSerial gpsSerial(5, 4); 
@@ -103,8 +118,6 @@ double motorSpeedFL = 0.0; // Front Left
 double motorSpeedRL = 0.0; // Rear Left
 double motorSpeedFR = 0.0; // Front Right
 double motorSpeedRR = 0.0; // Rear Right
-
-#include <math.h>
 
 // ==================================================================
 // 📌 ประกาศตัวแปรสถานะและเซนเซอร์ระดับ Global (สำหรับเชื่อมโยงระบบ)  ถาม AI Google Gemini
@@ -748,9 +761,23 @@ speedRight = target_base_speed + (target_yaw_rate * TRACK_WIDTH / 2.0);
 // ==========================================
 void setup() {
     Serial.begin(115200); 
-    gpsSerial.begin(38400);//gps 115200
-    gpsSerial.print("$PUBX,41,1,0003,0001,115200,0*1E\r\n");
-    gpsSerial.begin(115200);
+    //gpsSerial.begin(38400);//gps 115200
+    //gpsSerial.print("$PUBX,41,1,0003,0001,115200,0*1E\r\n");
+    //gpsSerial.begin(115200);
+       
+Serial1.begin(230400, SERIAL_8N1, RX1_B1PIN, TX1_B1PIN);
+Serial2.begin(115200, SERIAL_8N1, RX2_LIDAR, TX2_LIDAR); 
+  // 📌 🚀 เปิดพอร์ตจำลองช่องที่ 4 สำหรับคุยกับ A01NYUB ที่ความเร็วมาตรฐาน 9600 bps
+  //Serial3.begin(9600, SWSERIAL_8N1, RX3_A01NYUB, TX3_A01NYUB, false, 256);
+Serial3.begin(9600);
+delay(1500);     
+xDataMutex = xSemaphoreCreateMutex();
+xTaskCreatePinnedToCore(BackgroundReaderTask, "CommsReader", 8192, NULL, 3, NULL, 0);
+delay(1500);
+  analogWrite(RPLIDAR_MOTOR, 250);
+  uint8_t start_scan_cmd[] = {0xA5, 0x20};
+  Serial2.write(start_scan_cmd, 2);
+  delay(1000);
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) { delay(500); }
     Serial.write(CFG_VALSET_POSLLH, sizeof(CFG_VALSET_POSLLH)); delay(100);
@@ -799,4 +826,130 @@ void loop() {
     // ----------------------------------------------------------------------
 
     delay(10); 
+}
+
+// ------------------------------------------------------------------
+// 🛠 ฟังก์ชันย่อย: State Machine ถอดรหัสบิตข้อมูล 4 ไบต์จากเซนเซอร์ A01NYUB ดิบ
+// ------------------------------------------------------------------
+void parseA01NYUB() {
+    static int state = 0;
+    static uint8_t ultra_buf[4];
+    static int idx = 0;
+
+    while (Serial3.available() > 0) {
+        uint8_t c = Serial3.read();
+
+        switch (state) {
+            case 0: // ค้นหาหัวข้อความตัวเริ่ม 0xFF
+                if (c == 0xFF) {
+                    ultra_buf[0] = c;
+                    idx = 1;
+                    state = 1;
+                }
+                break;
+
+            case 1: // บันทึกไบต์ที่เหลือจนครบ 4 ไบต์
+                ultra_buf[idx++] = c;
+                if (idx >= 4) {
+                    // คำนวณหาค่าตรวจสอบ Checksum ความถูกต้องของข้อมูลสายบิต
+                    uint8_t sum = (ultra_buf[0] + ultra_buf[1] + ultra_buf[2]) & 0xFF;
+                    
+                    if (sum == ultra_buf[3]) { // ถ้ารหัส Checksum ตรงแปลว่าข้อมูลถูกต้อง
+                        // ประกอบบิตสูงและบิตต่ำรวมร่างเป็นระยะทางจริง (หน่วย: มิลลิเมตร)
+                        uint16_t raw_mm = (ultra_buf[1] << 8) | ultra_buf[2];
+                        
+                        // กรองค่าผิดพลาด (A01NYUB จะวัดระยะจริงได้ตั้งแต่ 280 mm ถึง 7500 mm)
+                        if (raw_mm >= 250 && raw_mm <= 7500) {
+                            if (xSemaphoreTake(xDataMutex, uint32_t(2))) {
+                                distance_A01NYUB = (float)raw_mm;
+                                
+                                // 💡 แถมคาถา Fail-Safe: ถ้าพี่เอาตัวนี้หันหน้าตรงยื่นไปด้านหน้า แล้วเจอคนตัดหน้าระยะประชิดต่ำกว่า 50 ซม.
+                                // ให้บีบปรับตัวแปรดักเบรกฉุกเฉินร่วมกับเรดาร์หลักได้ทันทีเพื่อความชัวร์ดับเบิ้ลล็อกครับ
+                                if (distance_A01NYUB < min_distance_recorded) {
+                                    min_distance_recorded = distance_A01NYUB;
+                                }
+                                xSemaphoreGive(xDataMutex);
+                            }
+                        }
+                    }
+                    state = 0; // รีเซ็ตสเตทเพื่อรอรับแพ็กเกจก้อนถัดไป
+                }
+                break;
+        }
+    }
+}
+
+void BackgroundReaderTask(void *pvParameters) {
+  for (;;) {
+    while (Serial1.available() > 0) { parseBoard1Packet(Serial1.read()); }
+    while (Serial2.available() > 0) { processOldLidarProtocol(Serial2.read()); } 
+    parseA01NYUB();
+    vTaskDelay(1 / portTICK_PERIOD_MS);//สิ่งที่ถูกต้อง: ให้เปลี่ยนไปใช้ฟังก์ชันมาตรฐาน pdMS_TO_TICKS(1) แทนครับ
+  }
+}
+
+// (ฟังก์ชัน parseBoard1Packet, processOldLidarProtocol, accumulate_obstacle_force คงเดิมสมบูรณ์...)
+void parseBoard1Packet(uint8_t c) {
+    static int state = 0; static int rx_index = 0;
+    switch (state) {
+        case 0: if (c == 0x6C) { decoder.raw_bytes[0] = c; rx_index = 1; state = 1; } break;
+        case 1:
+            decoder.raw_bytes[rx_index++] = c;
+            if (rx_index >= 38) { 
+                if (decoder.data.tail == 0xAA) {
+                    if (xSemaphoreTake(xDataMutex, uint32_t(2))) {
+                        b1_telemetry.float_yaw   = decoder.data.yaw;
+                        b1_telemetry.float_lat   = decoder.data.lat;  b1_telemetry.float_lon   = decoder.data.lon;  
+                        b1_telemetry.float_roll  = decoder.data.roll; b1_telemetry.float_pitch = decoder.data.pitch;
+                        b1_telemetry.grN_speed   = decoder.data.velN; b1_telemetry.grE_speed   = decoder.data.velE;
+                        b1_telemetry.ground_speed = sqrt(pow(decoder.data.velN, 2) + pow(decoder.data.velE, 2)) / 100.0;
+                        xSemaphoreGive(xDataMutex);
+                    }
+                }
+                state = 0;
+            }
+            break;
+    }
+}
+void processOldLidarProtocol(uint8_t rawByte) {
+    static int bufferIndex = 0; static uint8_t packetBuffer[5];
+    if (bufferIndex == 0) {
+        uint8_t startBit = rawByte & 0x01; uint8_t invertedStartBit = (rawByte >> 1) & 0x01;
+        if (startBit != invertedStartBit) packetBuffer[bufferIndex++] = rawByte;
+    } 
+    else if (bufferIndex == 1) {
+        if ((rawByte & 0x01) == 1) packetBuffer[bufferIndex++] = rawByte;
+        else bufferIndex = 0;
+    } 
+    else { packetBuffer[bufferIndex++] = rawByte; }
+    if (bufferIndex >= 5) {
+        uint8_t quality = packetBuffer[0] >> 2;
+        uint16_t rawAngle = (packetBuffer[1] >> 1) | (packetBuffer[2] << 7);
+        float angle = ((float)rawAngle) / 64.0; 
+        uint16_t rawDistance = packetBuffer[3] | (packetBuffer[4] << 8);
+        float distance = ((float)rawDistance) / 4.0; 
+        if (distance > 150.0 && distance <= 8000.0 && quality > 0) {
+            if (xSemaphoreTake(xDataMutex, uint32_t(2))) {
+                accumulate_obstacle_force(angle, distance, b1_telemetry.float_yaw);
+                if (angle >= 355.0 || angle <= 5.0) {
+                    if (distance < min_distance_recorded) { min_distance_recorded = distance; }
+                }
+        // 📌 จุดเพิ่มเติม: ถ้ารอบสแกนกวาดหน้าตรงจุดนี้ วัดระยะออกมาแล้วไกลทะลุทางโล่ง (เกิน 4 เมตรขึ้นไป)
+        // ให้สมองกลบน Core 0 สั่งปลดปล่อยเคลียร์ค่ากลับสู่ระยะเริ่มต้นออโต้ทันทีครับ
+        if ((angle >= 355.0 || angle <= 5.0) && distance > 1000.0) {
+            min_distance_recorded = distance;//8000.0
+        }
+                xSemaphoreGive(xDataMutex);
+            }
+        }
+        bufferIndex = 0;
+    }
+}
+void accumulate_obstacle_force(float angle_lidar, float distance_mm, float b1_yaw) {
+if (distance_mm > SAFE_DISTANCE) return;
+float angle_world_deg = b1_yaw + angle_lidar;
+if (angle_world_deg >= 360.0) angle_world_deg -= 360.0;
+float angle_rad = angle_world_deg * M_PI / 180.0;
+float force = 1000.0 / (distance_mm + 1.0);
+total_fx -= force * sin(angle_rad); total_fy -= force * cos(angle_rad);
 }
