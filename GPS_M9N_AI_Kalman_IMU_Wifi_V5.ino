@@ -208,12 +208,21 @@ void Main_Kalman_Update_Loop(float dtt, float FL_pwm2, float FR_pwm2, float BL_p
 
   float clean_velN = true_velN - v_gyro_North;
   float clean_velE = true_velE - v_gyro_East;
+
+  // 📌 Step 1: คำนวณระยะทางที่เสา GPS โยกเยกเบี่ยงเบนไป บนตัวบอดี้รถ (Body Frame)
+    // เมื่อหน้ารถทิ่ม (Pitch) หรือรถตะแคง (Roll) ความสูง Z จะส่งผลให้เสาเหวี่ยงออกด้านข้าง
+    float delta_x_body = (OFFSET_GPS_X * cos(pitch_rad)) + (OFFSET_GPS_Z * sin(pitch_rad));
+    float delta_y_body = (OFFSET_GPS_Y * cos(roll_rad))  - (OFFSET_GPS_Z * sin(roll_rad));
+
+    // 📌 Step 2: แตกแรงระยะที่โยกเยกเข้าสู่ทิศทางพิกัดโลก (Inertial Frame) โดยใช้มุม Yaw
+    float delta_North = (delta_x_body * cos(yaw_rad)) - (delta_y_body * sin(yaw_rad));
+    float delta_East  = (delta_x_body * sin(yaw_rad)) + (delta_y_body * cos(yaw_rad));
        
-// 📌 2. คำนวณระยะที่หัวเลเซอร์ "โยกเยก" บนตัวบอดี้รถ (ชดเชยเครื่องหมายทิศทางฟิสิกส์ขวา)
+// 📌 3. คำนวณระยะที่หัวเลเซอร์ "โยกเยก" บนตัวบอดี้รถ (ชดเชยเครื่องหมายทิศทางฟิสิกส์ขวา)
   float delta_lidar_x_body = (OFFSET_LIDAR_X * cos(pitch_rad)) - (OFFSET_LIDAR_Z * sin(pitch_rad));
   float delta_lidar_y_body = (OFFSET_LIDAR_Y * cos(roll_rad))  + (OFFSET_LIDAR_Z * sin(roll_rad));
 
-  // 📌 3. แปลงระยะโยกเยก 3 มิติเข้าสู่พิกัดโลก (Inertial Frame) ด้วยมุม Yaw
+  // 📌 4. แปลงระยะโยกเยก 3 มิติเข้าสู่พิกัดโลก (Inertial Frame) ด้วยมุม Yaw
   float lidar_offset_N = (delta_lidar_x_body * cos(yaw_rad)) - (delta_lidar_y_body * sin(yaw_rad));
   float lidar_offset_E = (delta_lidar_x_body * sin(yaw_rad)) + (delta_lidar_y_body * cos(yaw_rad));
 
