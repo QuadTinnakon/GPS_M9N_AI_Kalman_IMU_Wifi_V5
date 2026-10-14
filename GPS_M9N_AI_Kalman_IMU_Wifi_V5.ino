@@ -966,3 +966,120 @@ float angle_rad = angle_world_deg * M_PI / 180.0;
 float force = 1000.0 / (distance_mm + 1.0);
 total_fx -= force * sin(angle_rad); total_fy -= force * cos(angle_rad);
 }
+
+// ------------------------------------------------------------------
+// 🛠 ฟังก์ชันย่อย: State Machine ถอดรหัสบิตโปรโตคอล UBX โดยไม่พึ่งไลบรารี
+// ------------------------------------------------------------------
+void parseUBX(uint8_t c) {
+    static int state = 0;
+    static uint8_t gpsMsgClass = 0;
+    static uint8_t gpsMsgID = 0;
+    static uint16_t payloadLength = 0;
+    static uint16_t payloadCounter = 0;
+    static uint8_t payloadBuffer[92]; // ขนาดจองบัฟเฟอร์รองรับสูงสุดของโครงสร้าง NAV-PVT
+
+    switch (state) {
+        case 0: // ค้นหา Header ไบต์ที่ 1 (0xB5)
+            if (c == 0xB5) state = 1;
+            break;
+        case 1: // ค้นหา Header ไบต์ที่ 2 (0x62)
+            if (c == 0x62) state = 2;
+            else state = 0;
+            break;
+        case 2: // อ่านค่า Message Class
+            gpsMsgClass = c;
+            state = 3;
+            break;
+        case 3: // อ่านค่า Message ID
+            gpsMsgID = c;
+            state = 4;
+            break;
+        case 4: // อ่านขนาดความยาวตัวเครื่อง Payload (ไบต์ต่ำ)
+            payloadLength = c;
+            state = 5;
+            break;
+        case 5: // อ่านขนาดความยาวตัวเครื่อง Payload (ไบต์สูง)
+            payloadLength |= (c << 8);
+            if (payloadLength <= sizeof(payloadBuffer)) {
+                payloadCounter = 0;
+                state = 6;
+            } else {
+                state = 0; // ขนาดเกิน แปลว่าแพ็กเกจชำรุด ให้เริ่มหาหัวใหม่
+            }
+            break;
+        case 6: // คัดลอกข้อมูลบิตประจุลงบัฟเฟอร์ตามความยาว Payload จริง
+            payloadBuffer[payloadCounter++] = c;
+            if (payloadCounter >= payloadLength) {
+                state = 7; // อ่านไบต์ในเนื้อตัวเครื่องจบแล้ว ต่อไปเข้าเงื่อนไขตรวจสอบข้อมูล
+            }
+            break;
+        case 7: // ข้ามไบต์ตรวจสอบ Checksum A (เพื่อความเรียบง่ายประหยัดรอบ CPU)
+            state = 8;
+            break;
+        case 8: // ข้ามไบต์ตรวจสอบ Checksum B และทำข้อมูลแกะบิตจริง
+            // 📌 จุดสำคัญที่พี่เรียกใช้: เมื่อตัวบ่งชี้ Class และ ID แมตช์กับเงื่อนไข NAV-PVT
+            if (gpsMsgClass == 0x01 && gpsMsgID == 0x07) {
+                // เทข้อมูลบิตลงโครงสร้าง Struct คัดลอกแบบตรงบิตทันที (Memory Copy)
+                memcpy(&m9n_pvt_data, payloadBuffer, sizeof(UBX_NAV_PVT));
+                
+                // แปลงค่าหน่วยของ u-blox ออกมาใช้งาน
+                m9n_lat = m9n_pvt_data.latt / 10000000.0;
+                m9n_lon = m9n_pvt_data.lon / 10000000.0;
+                m9n_speed = m9n_pvt_data.gSpeed / 1000.0; // จาก mm/s แปลงเป็น m/s
+                m9n_speeN = m9n_pvt_data.velN / 1000.0;
+                m9n_speeE = m9n_pvt_data.velE / 1000.0;
+                m9n_numSV = m9n_pvt_data.numSV;
+                m9n_new_data = true;
+            }
+            state = 0; // รีเซ็ตเพื่อรับแพ็กเกจรอบถัดไป
+            break;
+    }
+}
+
+// ------------------------------------------------------------------
+// 🚀 ฟังก์ชันทำงานพื้นหลังบน Core 0 (ทำหน้าที่ดูดสตรีม MAVLink คงเดิม)
+// ------------------------------------------------------------------
+void MAVLinkReaderTask(void *pvParameters) {
+  mavlink_message_t msg;
+  mavlink_status_t status;
+
+  for (;;) {
+    while (Serial1.available() > 0) {
+      uint8_t c = Serial1.read();
+      if (mavlink_parse_char(MAVLINK_COMM_1, c, &msg, &status)) {
+        if (msg.msgid == MAVLINK_MSG_ID_GLOBAL_POSITION_INT) {
+          mavlink_global_position_int_t pos;
+          mavlink_msg_global_position_int_decode(&msg, &pos);
+          if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+            telemetry.latt = pos.lat / 10000000.0;
+            telemetry.lon = pos.lon / 10000000.0;
+            telemetry.compass_hdg = pos.hdg / 100.0;
+            telemetry.g_speeN = pos.vx / 100.0; // cm/s
+            telemetry.g_speeE = pos.vy / 100.0;
+            telemetry.ground_speed = sqrt(pow(pos.vx, 2) + pow(pos.vy, 2)) / 100.0;
+            telemetry.has_new_data = true;
+            xSemaphoreGive(xMutex);
+          }
+        }
+        else if (msg.msgid == MAVLINK_MSG_ID_ATTITUDE) {
+          mavlink_attitude_t att;
+          mavlink_msg_attitude_decode(&msg, &att);
+          float r = att.roll  * (180.0 / M_PI);
+          float p = att.pitch * (180.0 / M_PI);
+          float y = att.yaw   * (180.0 / M_PI);
+          if (y < 0) y += 360.0;
+
+          if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+            telemetry.roll = r;
+            telemetry.pitch = p;
+            telemetry.yaw = y;
+            telemetry.has_new_data = true;
+            xSemaphoreGive(xMutex);
+          }
+        }
+      }
+    }
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+  }
+}
+//////////////////////////////////////////////////////////////////////////////////
