@@ -72,6 +72,14 @@ double filtered_lat = 0.0, filtered_lon = 0.0;
 unsigned long lastTime = 0;
 double imu_ax = 0.0, imu_ay = 0.0, imu_gz = 0.0;
 
+ // --- 1. ตั้งค่าระยะเยื้องจริงที่วัดได้จากตัวรถ (หน่วย: เมตร) ---
+const float OFFSET_GPS_X   = -0.095;  // GPS อยู่ข้างหน้าจุดหมุน 12 cm ระยะจากจุดหมุนรถ ไปยัง เสา GPS
+const float OFFSET_GPS_Y   = 0.000; // GPS ติดตั้งเยื้องไปทางซ้ายของกลางรถ 5 cm (ค่าจึงเป็นลบ)
+const float OFFSET_GPS_Z   0.65f  // ⚠️ ความสูงของเสา GPS จากจุดหมุนรถ (สูง 65 ซม.)
+const float OFFSET_LIDAR_X = 0.245;  // LiDAR อยู่ข้างหน้าจุดหมุน 45 cm ระยะจากจุดหมุนรถ ไปยัง LiDAR
+const float OFFSET_LIDAR_Y = 0.000;  // LiDAR อยู่ตรงกลางรถพอดีเป๊ะ ไม่เยื้องซ้ายขวา
+const float OFFSET_LIDAR_Z   0.35f  // ⚠️ ความสูงของตัว LiDAR วัดจากระนาบจุดหมุน CG ขึ้นมา (เช่น สูง 35 ซม.)
+
 // พารามิเตอร์ Pure Pursuit
 struct Waypoint { double lat; double lon; double targetN; double targetE; };
 Waypoint waypoints[] = { {13.847123, 100.493456, 0, 0}, {13.847550, 100.493900, 0, 0} };
