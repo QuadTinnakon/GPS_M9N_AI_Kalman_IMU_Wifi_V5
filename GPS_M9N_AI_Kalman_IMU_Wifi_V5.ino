@@ -13,7 +13,7 @@ UBLOX    - U-Blox binary protocol, use the ublox config file (u-blox-config.ublo
 */
 #include <ESP8266WiFi.h>
 #include <WiFiUDP.h>
-#include <SoftwareSerial.h>
+#include <HardwareSerial.h>
 #include <SoftwareSerial.h> // 📌 เรียกใช้งานไลบรารี EspSoftwareSerial สำหรับช่องทางที่ 4
 #include <math.h>
 #include <SPI.h>
