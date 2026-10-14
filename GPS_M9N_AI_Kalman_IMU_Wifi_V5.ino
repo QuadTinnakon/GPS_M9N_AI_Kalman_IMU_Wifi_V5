@@ -802,6 +802,8 @@ float distance_A01NYUB = 0.0;
 SemaphoreHandle_t xDataMutex = NULL; 
 unsigned long last_vector_time = 0;
 
+void MAVLinkReaderTask(void *pvParameters);
+void parseUBX(uint8_t c); // ฟังก์ชันถอดรหัสบิตแพ็กเกจ UBX
 void BackgroundReaderTask(void *pvParameters);
 void parseBoard1Packet(uint8_t c);
 void processOldLidarProtocol(uint8_t rawByte);
