@@ -756,6 +756,19 @@ speedRight = target_base_speed + (target_yaw_rate * TRACK_WIDTH / 2.0);
     }
     analogWrite(pinENB, pwmRight);
 }
+
+// 📌 ตัวแปรเก็บระยะทางจริงที่แกะได้จาก A01NYUB (หน่วย: มิลลิเมตร)
+float distance_A01NYUB = 0.0; 
+
+SemaphoreHandle_t xDataMutex = NULL; 
+unsigned long last_vector_time = 0;
+
+void BackgroundReaderTask(void *pvParameters);
+void parseBoard1Packet(uint8_t c);
+void processOldLidarProtocol(uint8_t rawByte);
+void parseA01NYUB(); // ฟังก์ชันดักแกะบิตคลื่นอัลตร้าโซนิก
+void accumulate_obstacle_force(float angle_lidar, float distance_mm, float b1_yaw);
+
 // ==========================================
 // 9. ฟังก์ชันตั้งค่าระบบและลูปหลัก
 // ==========================================
