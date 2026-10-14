@@ -208,7 +208,16 @@ void Main_Kalman_Update_Loop(float dtt, float FL_pwm2, float FR_pwm2, float BL_p
 
   float clean_velN = true_velN - v_gyro_North;
   float clean_velE = true_velE - v_gyro_East;
+       
+// 📌 2. คำนวณระยะที่หัวเลเซอร์ "โยกเยก" บนตัวบอดี้รถ (ชดเชยเครื่องหมายทิศทางฟิสิกส์ขวา)
+  float delta_lidar_x_body = (OFFSET_LIDAR_X * cos(pitch_rad)) - (OFFSET_LIDAR_Z * sin(pitch_rad));
+  float delta_lidar_y_body = (OFFSET_LIDAR_Y * cos(roll_rad))  + (OFFSET_LIDAR_Z * sin(roll_rad));
 
+  // 📌 3. แปลงระยะโยกเยก 3 มิติเข้าสู่พิกัดโลก (Inertial Frame) ด้วยมุม Yaw
+  float lidar_offset_N = (delta_lidar_x_body * cos(yaw_rad)) - (delta_lidar_y_body * sin(yaw_rad));
+  float lidar_offset_E = (delta_lidar_x_body * sin(yaw_rad)) + (delta_lidar_y_body * cos(yaw_rad));
+
+       
   // ------------------------------------------------------------------
   // PHASE 4: STATE UPDATE FOR VELOCITY & GYRO (ความเร็วเชิงเส้น-เชิงมุม)
   // ------------------------------------------------------------------
