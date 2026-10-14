@@ -96,6 +96,217 @@ double motorSpeedRL = 0.0; // Rear Left
 double motorSpeedFR = 0.0; // Front Right
 double motorSpeedRR = 0.0; // Rear Right
 
+#include <math.h>
+
+// ==================================================================
+// 📌 ประกาศตัวแปรสถานะและเซนเซอร์ระดับ Global (สำหรับเชื่อมโยงระบบ)  ถาม AI Google Gemini
+//โครงสร้างฟังก์ชัน Main_Kalman_Update_Loop() แบบรวมร่างสมบูรณ์แบบเสร็จสรรพในฟังก์ชันเดียว โดยถอดบทเรียนจาก คณิตศาสตร์ฟิสิกส์ 12 สถานะ, 
+//ระบบล้างแรงเหวี่ยงหนีศูนย์, Adaptive Gain ตามรอบมอเตอร์ และระบบแปลงพิกัดมุมส่าย (Yaw Transformation) ร่วมกับ LiDAR และ Dual Ultrasonic ครับ
+
+// ==================================================================
+// ตัวแปรสถานะ (States X_1 ถึง X_12)
+float X_1 = 0.0f;  // Position North (m)
+float X_2 = 0.0f;  // Position East (m)
+float X_3 = 0.0f;  // Yaw Angle (rad)
+float X_4 = 0.0f;  // Velocity X Body (m/s)
+float X_5 = 0.0f;  // Velocity Y Body (m/s)
+float X_6 = 0.0f;  // Gyro Z / Yaw Rate (rad/s)
+float X_7 = 0.0f;  // Motor 1 Speed (rad/s)
+float X_8 = 0.0f;  // Motor 2 Speed (rad/s)
+float X_9 = 0.0f;  // Motor 3 Speed (rad/s)
+float X_10 = 0.0f; // Motor 4 Speed (rad/s)
+float X_11 = 0.0f; // Accel X Filtered
+float X_12 = 0.0f; // Accel Y Filtered
+
+// ระยะติดตั้งเซนเซอร์ GPS/LiDAR ห่างจากจุดศูนย์กลางเครื่อง (CG) หน่วย: เมตร
+#define OFFSET_GPS_X  0.10f  
+#define OFFSET_GPS_Y  0.00f  
+
+// อาร์เรย์และค่าแชร์จากหน่วยประมวลผลฉากหลัง (Background RTOS Tasks)
+extern float global_lidar_distance[360];
+extern volatile float dist_front_meters;
+extern volatile float dist_back_meters;
+extern float GyroZ, AccXf, AccYf, angle_diff;
+extern float true_velN, true_velE;
+extern SemaphoreHandle_t lidarMutex;
+
+// ==================================================================
+// 🛠 ฟังก์ชันย่อยสำหรับคัดกรองกรวยมุมเลเซอร์ LiDAR (Angle Window Max Filter)
+// ==================================================================
+float get_filtered_distance(float* lidar_array, int target_angle, int window_size) {
+    float valid_samples[61]; // รองรับ window สูงสุด 30 องศา (±30)
+    int sample_count = 0;
+    
+    for (int i = -window_size; i <= window_size; i++) {
+        int current_angle = target_angle + i;
+        if (current_angle < 0) current_angle += 360;
+        if (current_angle >= 360) current_angle -= 360;
+        
+        float raw_dist = lidar_array[current_angle];
+        if (raw_dist > 0.15f && raw_dist < 6.0f) {
+            valid_samples[sample_count] = raw_dist;
+            sample_count++;
+        }
+    }
+    if (sample_count == 0) return -1.0f; 
+    
+    // คืนค่าที่ไหลที่สุดในกรวยเพื่อทะลุสิ่งกีดขวางไปหาผนังห้องจริง
+    float max_dist = 0.0f;
+    for (int j = 0; j < sample_count; j++) {
+        if (valid_samples[j] > max_dist) max_dist = valid_samples[j];
+    }
+    return max_dist;
+}
+
+// ฟังก์ชันควบคุมมุมให้อยู่ในกรอบ 0 ถึง 2*PI
+float normalizeAngle2Pi(float angle) {
+    angle = fmod(angle, 2.0f * M_PI);
+    if (angle < 0) angle += 2.0f * M_PI;
+    return angle;
+}
+
+// ==================================================================
+// 🚀 ฟังก์ชันหลัก: ลูปทำนายและอัปเดตสถานะตัวกรอง (จบในหนึ่งเดียว)
+// ==================================================================
+void Main_Kalman_Update_Loop(float dtt, float FL_pwm2, float FR_pwm2, float BL_pwm2, float BR_pwm2) {
+  
+  // ------------------------------------------------------------------
+  // PHASE 1: PREDICTION (คำนวณสถานะมอเตอร์และแรงขับล่วงหน้าด้วยคณิตศาสตร์ฟิสิกส์)
+  // ------------------------------------------------------------------
+  X_10 = X_10 + ((BR_pwm2 * 6.765f) - (X_10 * 37.47f)) * dtt; // Motor M4 ω₄
+  X_9  = X_9  + ((BL_pwm2 * 6.765f) - (X_9  * 37.47f)) * dtt; // Motor M3 ω₃
+  X_8  = X_8  + ((FR_pwm2 * 6.765f) - (X_8  * 37.47f)) * dtt; // Motor M2 ω₂
+  X_7  = X_7  + ((FL_pwm2 * 6.765f) - (X_7  * 37.47f)) * dtt; // Motor M1 ω₁
+
+  float Fxx = X_7 + X_8 + X_9 + X_10; // Total Thrust
+  float Fyy = X_8 - X_7 + X_10 - X_9; // Pitch Dynamic
+  float Tzz = X_8 - X_7 + X_9 - X_10; // Yaw Torque
+
+  // ------------------------------------------------------------------
+  // PHASE 2: ADAPTIVE GAIN CALCULATION (เปลี่ยน Noise แบบเรียลไทม์ตามรอบมอเตอร์)
+  // ------------------------------------------------------------------
+  float motor_speed_avg = (X_7 + X_8 + X_9 + X_10) * 0.25f;
+  float motor_min_speed = 100.0f; 
+  float motor_max_speed = 800.0f; 
+  float v_factor = (motor_speed_avg - motor_min_speed) / (motor_max_speed - motor_min_speed);
+  if(v_factor < 0.0f) v_factor = 0.0f;
+  if(v_factor > 1.0f) v_factor = 1.0f;
+
+  float K_vel = 0.954f - (v_factor * 0.700f); // บินเร็วมอเตอร์สั่น -> ลดการเชื่อเซนเซอร์ความเร็ว
+  float K_acc = 13.254f - (v_factor * 10.000f); // บินเร็วมอเตอร์สั่น -> ลดการเชื่อเซนเซอร์ IMU ความเร่ง
+
+  // ------------------------------------------------------------------
+  // PHASE 3: LEVER ARM COMPENSATION (คาถาล้างแรงเหวี่ยงหนีศูนย์ของเซนเซอร์ความเร็ว)
+  // ------------------------------------------------------------------
+  float wz_rad = GyroZ; 
+  float v_gyro_x = -wz_rad * OFFSET_GPS_Y;
+  float v_gyro_y =  wz_rad * OFFSET_GPS_X;
+
+  // แปลงความเร็วเหวี่ยงเข้าสู่พิกัดโลกก่อนทำความสะอาด
+  float v_gyro_North = (v_gyro_x * cos(X_3)) - (v_gyro_y * sin(X_3));
+  float v_gyro_East  = (v_gyro_x * sin(X_3)) + (v_gyro_y * cos(X_3));
+
+  float clean_velN = true_velN - v_gyro_North;
+  float clean_velE = true_velE - v_gyro_East;
+
+  // ------------------------------------------------------------------
+  // PHASE 4: STATE UPDATE FOR VELOCITY & GYRO (ความเร็วเชิงเส้น-เชิงมุม)
+  // ------------------------------------------------------------------
+  X_6  = X_6  + ((Tzz * -0.018889f) - (X_6 * 10.1556111f) + (GyroZ - X_6) * 55.8291f) * dtt;
+  X_5  = X_5  + ((Fyy * 0.000150f) - (X_5 * 10.4494100f) + (clean_velE - X_5) * K_vel) * dtt;
+  X_4  = X_4  + ((Fxx * 0.297040f) - (X_4 * 8.8235290f) + (clean_velN - X_4) * K_vel) * dtt;
+  X_11 = X_11 + ((Fxx * 0.1692081f) - (X_4 * 9.4845100f) + (AccXf - X_11) * K_acc) * dtt;
+  X_12 = X_12 + ((Fxx * -0.119521f) - (X_4 * -7.0445000f) + (AccYf - X_12) * K_acc) * dtt;
+
+  // อัปเดตมุม Yaw (สถานะ X_3)
+  X_3 = X_3 + (X_6 + angle_diff * 0.917f) * dtt;
+  X_3 = normalizeAngle2Pi(X_3);
+
+  // ------------------------------------------------------------------
+  // PHASE 5: COORDINATE ROTATION FOR LIDAR 360 (หมุนพิกัดเลเซอร์ตามมุมส่ายตัวลำ)
+  // ------------------------------------------------------------------
+  float yaw_deg_raw = fmod(X_3 * 180.0f / M_PI, 360.0f);
+  int drone_yaw_deg = (int)yaw_deg_raw;
+  if (drone_yaw_deg < 0) drone_yaw_deg += 360;
+
+  int target_N = 0   - drone_yaw_deg; if (target_N < 0) target_N += 360;
+  int target_E = 90  - drone_yaw_deg; if (target_E < 0) target_E += 360;
+  int target_S = 180 - drone_yaw_deg; if (target_S < 0) target_S += 360;
+
+  float r_lidar_North = -1.0f;
+  float r_lidar_East  = -1.0f;
+  float r_lidar_South = -1.0f;
+
+  // ดึงข้อมูลอาเรย์จากเซนเซอร์ฉากหลังอย่างปลอดภัยด้วย Mutex
+  if (xSemaphoreTake(lidarMutex, (TickType_t)5) == pdTRUE) {
+      r_lidar_North = get_filtered_distance(global_lidar_distance, target_N, 15);
+      r_lidar_East  = get_filtered_distance(global_lidar_distance, target_E, 15);
+      r_lidar_South = get_filtered_distance(global_lidar_distance, target_S, 15);
+      xSemaphoreGive(lidarMutex);
+  }
+
+  // ------------------------------------------------------------------
+  // PHASE 6: DYNAMIC WALL & DUAL ULTRASONIC FUSION (คำนวณและผสมสัญญาณตำแหน่ง)
+  // ------------------------------------------------------------------
+  float final_posN = X_1;
+  float final_posE = X_2;
+  float K_pos_N = 0.0154f;
+  float K_pos_E = 0.0124f;
+
+  // --- จัดการแกนทิศเหนือ-ใต้ (แกน X โลก หรือ North) ---
+  if (r_lidar_North > 0.0f && r_lidar_South > 0.0f) {
+      // สร้างพิกัดกำแพงโลกปัจจุบันแบบแปรผันตามแผนที่จริง
+      float dynamic_wall_north = X_1 + r_lidar_North;
+      float dynamic_wall_south = X_1 - r_lidar_South;
+
+      // แตกเวกเตอร์ระยะทางแนวเอียงของ Ultrasonic เข้าสู่แกนตรงพิกัดโลก
+      float front_dist_world_N = dist_front_meters * cos(X_3);
+      float back_dist_world_N  = -dist_back_meters * cos(X_3);
+
+      // แปลงเป็นค่าพิกัดตัวลำอ้างอิงกำแพงแปรผัน
+      float pos_N_from_front = dynamic_wall_north - front_dist_world_N;
+      float pos_N_from_back  = dynamic_wall_south - back_dist_world_N;
+
+      float sum_posN = 0.0f;
+      float weight_N = 0.0f;
+
+      // ดักสัญญาณกระชากหลบสิ่งกีดขวาง (Innovation Gate 40 เซนติเมตร)
+      if (abs(pos_N_from_front - X_1) < 0.40f && dist_front_meters > 0.28f) {
+          sum_posN += pos_N_from_front; weight_N += 1.0f;
+      }
+      if (abs(pos_N_from_back - X_1) < 0.40f && dist_back_meters > 0.28f) {
+          sum_posN += pos_N_from_back; weight_N += 1.0f;
+      }
+
+      // ตกผลึกหาข้อสรุปตำแหน่งร่วมกันด่านสุดท้าย
+      float lidar_base_posN = dynamic_wall_north - r_lidar_North;
+      if (weight_N > 0.0f) {
+          final_posN = (lidar_base_posN * 0.5f) + ((sum_posN / weight_N) * 0.5f);
+          K_pos_N = 0.035f; // เพิ่มแรงดึง Gain เมื่อข้อมูลเซนเซอร์ผ่านเกณฑ์ยืนยันร่วมกัน
+      } else {
+          final_posN = lidar_base_posN; // ถ้าโดนบังกระชั้นชิด พึ่งพาเฉพาะข้อมูลเสถียรของ LiDAR ล่วงหน้า
+          K_pos_N = 0.020f;
+      }
+  }
+
+  // --- จัดการแกนทิศตะวันออก-ตะวันตก (แกน Y โลก หรือ East) ---
+  if (r_lidar_East > 0.0f) {
+      float dynamic_wall_east = X_2 + r_lidar_East;
+      final_posE = dynamic_wall_east - r_lidar_East;
+      K_pos_E = 0.025f;
+  }
+
+  // ------------------------------------------------------------------
+  // PHASE 7: POSITION FINAL INTEGRATION (แปลงความเร็วประกอบพิกัดอัปเดตเข้า X_1, X_2)
+  // ------------------------------------------------------------------
+  float vel_world_N = (X_4 * cos(X_3)) - (X_5 * sin(X_3));
+  float vel_world_E = (X_4 * sin(X_3)) + (X_5 * cos(X_3));
+
+  X_1 = X_1 + (vel_world_N + (final_posN - X_1) * K_pos_N) * dtt;
+  X_2 = X_2 + (vel_world_E + (final_posE - X_2) * K_pos_E) * dtt;
+}
+////////////////////////////////////////////////////////////////////////////
+
 void calculateDifferentialDrive() {
     if (isNavigationComplete) {
         // หากถึงเป้าหมาย Waypoint ครบถ้วนแล้ว สั่งหยุดมอเตอร์ทั้งหมดทันที
