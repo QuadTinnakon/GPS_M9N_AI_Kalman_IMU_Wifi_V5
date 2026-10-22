@@ -3,4 +3,4 @@ Development of a Position and Speed Control System for a 4-Wheel Drive Electric 
 
 <img width="1236" height="691" alt="Image" src="https://github.com/user-attachments/assets/9dab3631-915d-4e33-8197-e7911cb95853" />
 
-<img width="1236" height="691" alt="Image" src="[https://github.com/user-attachments/assets/9dab3631-915d-4e33-8197-e7911cb95853](https://github.com/QuadTinnakon/GPS_M9N_AI_Kalman_IMU_Wifi_V5/issues/2#issue-5972595149)" />
+<img width="1364" height="768" alt="Image" src="https://github.com/user-attachments/assets/ee9bae63-dae3-4a90-b38b-23892de8de7a" />
